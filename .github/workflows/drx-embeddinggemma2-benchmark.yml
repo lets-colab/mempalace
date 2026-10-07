@@ -1,0 +1,69 @@
+name: DRX EmbeddingGemma2 Synthetic Benchmark
+on:
+  push:
+    branches: [drx-embeddinggemma2-benchmark-20261007]
+  workflow_dispatch:
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install bounded benchmark dependencies
+        run: pip install --disable-pip-version-check -q "transformers>=4.57.0" torch pillow psutil
+      - name: Run synthetic-only benchmark
+        run: |
+          cat > /tmp/bench.py <<'PY'
+          import json,time,resource,os
+          import torch
+          from transformers import AutoModel, AutoProcessor
+          MODEL="google/embeddinggemma-2"
+          docs=[
+            "DR.X keeps canonical truth outside vendor native memory.",
+            "Approval gates protect consequential writes and production changes.",
+            "Retrieval must default deny cross project context.",
+            "Evidence distinguishes planned built tested live and proven states.",
+            "Rollback is required for reversible experimental changes."
+          ]
+          queries=[
+            ("Where is canonical truth stored?",0),
+            ("What protects production changes?",1),
+            ("How should cross project retrieval behave?",2),
+            ("What states separate evidence maturity?",3),
+            ("What must an experiment support to reverse safely?",4),
+          ]
+          t0=time.perf_counter()
+          processor=AutoProcessor.from_pretrained(MODEL)
+          model=AutoModel.from_pretrained(MODEL).eval()
+          load_s=time.perf_counter()-t0
+          def emb(texts, is_query=False):
+            prefix="task: search result | query: " if is_query else "title: synthetic | text: "
+            inputs=processor(text=[prefix+x for x in texts],return_tensors="pt",padding=True,truncation=True)
+            with torch.no_grad():
+              out=model(**inputs)
+            h=out.last_hidden_state
+            mask=inputs["attention_mask"].unsqueeze(-1)
+            v=(h*mask).sum(1)/mask.sum(1).clamp(min=1)
+            return torch.nn.functional.normalize(v,p=2,dim=1)
+          t1=time.perf_counter(); dv=emb(docs); encode_docs_s=time.perf_counter()-t1
+          results=[]; correct=0; rr=0.0; qlat=[]
+          for q,expected in queries:
+            a=time.perf_counter(); qv=emb([q],True); scores=(qv@dv.T)[0]; qlat.append(time.perf_counter()-a)
+            order=torch.argsort(scores,descending=True).tolist()
+            rank=order.index(expected)+1
+            correct += rank==1; rr += 1/rank
+            results.append({"query":q,"expected":expected,"ranking":order,"scores":[round(float(scores[i]),6) for i in order],"rank":rank})
+          peak_kb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+          print("DRX_BENCHMARK_JSON="+json.dumps({
+            "model":MODEL,"synthetic_only":True,"external_private_data_egress":False,
+            "cases":5,"top1_correct":correct,"top1_accuracy":correct/5,"mrr":rr/5,
+            "load_seconds":round(load_s,3),"document_encode_seconds":round(encode_docs_s,3),
+            "query_latency_seconds":[round(x,3) for x in qlat],
+            "peak_rss_mb":round(peak_kb/1024,1),"results":results
+          },sort_keys=True))
+          assert correct==5, f"Top1 regression: {correct}/5"
+          PY
+          python /tmp/bench.py
